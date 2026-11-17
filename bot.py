@@ -1,10 +1,8 @@
 import os, sys, json, re, html, time, random
 import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
-from google import genai
 
 # --- AYARLAR (anahtarlar GitHub Secrets'tan gelir) ---
-GEMINI_KEY = os.environ["GEMINI_KEY"]
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 ARAMA_LINKLERI = [l.strip() for l in os.environ["SEARCH_URLS"].splitlines() if l.strip()]
@@ -14,7 +12,7 @@ FILTRE_AKTIF = True   # False yaparsan hasarlı ilanlar da gelir
 MAX_ILAN = 5          # her çalışmada en fazla kaç yeni ilan incelensin
 SEEN_FILE = "seen.json"
 
-# 0 = sadece orijinal, 1 = boyalı/lokal olabilir, 2 = fark etmez
+# 0 = sadece orijinal, 1 = lokal boyalı olabilir, 2 = fark etmez
 PARCA_AYARLARI = {
     "tavan": 0, "kaput": 0, "bagaj": 1,
     "sol ön çamurluk": 2, "sağ ön çamurluk": 2,
@@ -22,8 +20,6 @@ PARCA_AYARLARI = {
     "sol ön kapı": 2, "sağ ön kapı": 2,
     "sol arka kapı": 2, "sağ arka kapı": 2,
 }
-
-ai_client = genai.Client(api_key=GEMINI_KEY)
 
 
 def telegram_gonder(mesaj):
@@ -87,7 +83,6 @@ def extract_vehicle_info(tab, log):
             if m_yil and yil == "-": yil = m_yil.group(1)
     except Exception:
         pass
-    log.append("KM/Yıl DOM üzerinden okundu.")
     return yil, km
 
 
@@ -132,68 +127,58 @@ def extract_description(tab):
     return ""
 
 
-# --- GEMINI ---
-def parse_gemini_response(text):
-    try:
-        temiz = text.replace("```json", "").replace("```", "").strip()
-        m = re.search(r"\{.*?\}", temiz, re.DOTALL)
-        if m:
-            return {k.lower().strip(): int(v) for k, v in json.loads(m.group(0)).items()}
-    except Exception:
-        pass
-    return {}
-
-
-SABLON = ('{"tavan":0, "kaput":0, "bagaj":0, "sol ön çamurluk":0, "sağ ön çamurluk":0, '
-          '"sol arka çamurluk":0, "sağ arka çamurluk":0, "sol ön kapı":0, "sağ ön kapı":0, '
-          '"sol arka kapı":0, "sağ arka kapı":0}')
-
-
-def gemini_sor(prompt):
-    try:
-        r = ai_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        return parse_gemini_response(r.text)
-    except Exception as e:
-        print("[GEMINI HATA]", e)
-        return {}
+# --- ANALİZ (yapay zekasız) ---
+def _parca_bul(metin):
+    m = metin.lower()
+    m = m.replace("motor kaputu", "kaput").replace("bagaj kapağı", "bagaj")
+    for parca in PARCA_AYARLARI:
+        if parca in m:
+            return parca
+    for parca in ("tavan", "kaput", "bagaj"):
+        if parca in m:
+            return parca
+    return None
 
 
 def analyze_list(json_string):
-    if json_string == "[]":
-        return {}
-    return gemini_sor(
-        "Aşağıda bir araba ilanının ekspertiz panelinden çekilmiş ham liste verisi var.\n"
-        "Kurallar: Orijinal / Listede olmayan = 0, Lokal Boyalı = 1, Boyalı = 2, Değişen = 3. "
-        "'Motor Kaputu' = 'kaput'\n"
-        f"Sadece şu formatta JSON döndür:\n{SABLON}\nHAM LİSTE: {json_string}")
+    sonuc = {}
+    try:
+        for x in json.loads(json_string):
+            parca = _parca_bul(x["parca"])
+            d = x["durum"].lower()
+            if "değişen" in d:
+                seviye = 3
+            elif "lokal" in d:
+                seviye = 1
+            elif "boyalı" in d or "boyali" in d:
+                seviye = 2
+            else:
+                continue
+            if parca:
+                sonuc[parca] = max(sonuc.get(parca, 0), seviye)
+    except Exception:
+        pass
+    return sonuc
+
+
+ANAHTAR = ("boyalı", "boyali", "boya", "değişen", "degisen", "değişmiş",
+           "lokal", "çizik", "ezik", "hasar", "tramer", "kaza")
 
 
 def analyze_description(metin):
+    """Açıklamada hasar ifadesi geçen cümleleri döndürür."""
     if not metin:
-        return {}
-    return gemini_sor(
-        "Aşağıdaki araç ilan açıklamasını oku. Satıcının metinde itiraf ettiği hasarları bul.\n"
-        "Kurallar: Orijinal = 0, Lokal Boyalı = 1, Boyalı = 2, Değişen = 3.\n"
-        f"Sadece şu JSON formatını döndür:\n{SABLON}\nAçıklama: {metin}")
-
-
-def cross_check(sema, aciklama, log):
-    durum_str = {0: "Orijinal", 1: "Lokal Boyalı", 2: "Boyalı", 3: "Değişen"}
-    nihai, celiskiler = {}, []
-    for parca in PARCA_AYARLARI:
-        s, a = sema.get(parca, 0), aciklama.get(parca, 0)
-        if s != a:
-            celiskiler.append(f"⚠ {parca.title()}: Liste={durum_str.get(s, '?')} | Açıklama={durum_str.get(a, '?')}")
-            nihai[parca] = max(s, a)
-        else:
-            nihai[parca] = s
-    if celiskiler:
-        log.append("Açıklama ile ekspertiz listesi uyuşmuyor!")
-    return nihai, celiskiler
+        return []
+    cumleler = re.split(r"[.\n!?]+", metin)
+    return [c.strip() for c in cumleler
+            if any(k in c.lower() for k in ANAHTAR)
+            and "hasarsız" not in c.lower()
+            and "boyasız" not in c.lower()
+            and "değişensiz" not in c.lower()][:5]
 
 
 # --- RAPOR ---
-def send_report(ilan, yil, km, nihai, celiskiler, log, ham_json):
+def send_report(ilan, yil, km, nihai, supheli, log, ham_json):
     temiz_mi = True
     lokal, boyali, degisen = [], [], []
     for parca, durum in nihai.items():
@@ -203,7 +188,7 @@ def send_report(ilan, yil, km, nihai, celiskiler, log, ham_json):
             if ayar == 0: temiz_mi = False
         elif durum == 2:
             boyali.append(parca.title())
-            if ayar == 0: temiz_mi = False
+            if ayar < 2: temiz_mi = False
         elif durum == 3:
             degisen.append(parca.title())
             if ayar < 2: temiz_mi = False
@@ -216,8 +201,12 @@ def send_report(ilan, yil, km, nihai, celiskiler, log, ham_json):
     if degisen: satirlar.append(f"🔴 <b>Değişen ({len(degisen)}):</b> {', '.join(degisen)}")
     if boyali: satirlar.append(f"🟠 <b>Boyalı ({len(boyali)}):</b> {', '.join(boyali)}")
     if lokal: satirlar.append(f"🟡 <b>Lokal Boyalı ({len(lokal)}):</b> {', '.join(lokal)}")
-    rapor = "\n".join(satirlar) if satirlar else "🟢 <b>Tüm Parçalar Orijinal / Hatasız</b>"
-    celiski_str = html.escape("\n".join(celiskiler)) if celiskiler else "✅ Çelişki yok"
+    rapor = "\n".join(satirlar) if satirlar else "🟢 <b>Listede hasar görünmüyor</b>"
+
+    if supheli:
+        supheli_str = html.escape("\n".join("• " + c[:200] for c in supheli))
+    else:
+        supheli_str = "✅ Açıklamada hasar ifadesi yok"
 
     ham = "Araç kusursuz veya liste açılmadı."
     if ham_json != "[]":
@@ -233,7 +222,7 @@ def send_report(ilan, yil, km, nihai, celiskiler, log, ham_json):
         f"💰 <b>Fiyat:</b> {html.escape(ilan['fiyat'])}\n"
         f"📅 <b>Yıl:</b> {html.escape(str(yil))} | 🛣️ <b>KM:</b> {html.escape(str(km))}\n\n"
         f"🚘 <b>HASAR DURUMU:</b>\n{rapor}\n\n"
-        f"📊 <b>Uyuşmazlık:</b>\n{celiski_str}\n\n"
+        f"📝 <b>Açıklamada geçenler:</b>\n{supheli_str}\n\n"
         f"🔬 <b>Siteden çekilen liste:</b>\n{ham}\n\n"
         f"🔗 <a href='{ilan['link']}'>İlana Git</a>"
     )
@@ -250,10 +239,9 @@ def scan_listing(page, ilan):
         aciklama = extract_description(tab)
     finally:
         tab.close()
-    sema = analyze_list(ham_json)
-    ai_acik = analyze_description(aciklama)
-    nihai, celiskiler = cross_check(sema, ai_acik, log)
-    send_report(ilan, yil, km, nihai, celiskiler, log, ham_json)
+    nihai = analyze_list(ham_json)
+    supheli = analyze_description(aciklama)
+    send_report(ilan, yil, km, nihai, supheli, log, ham_json)
 
 
 # --- ANA AKIŞ ---
